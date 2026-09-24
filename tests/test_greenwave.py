@@ -3,6 +3,7 @@ import pytest
 from app.greenwave import (
     compute_windows,
     departure_windows_for_intersection,
+    eroded_green_components,
     intersect_interval_lists,
     local_green_intervals,
     merge_intervals,
@@ -126,6 +127,91 @@ def test_half_open_endpoints_are_never_green():
     assert got == [[20, 30]]  # 30 不被包含
 
 
+# ---------- 行驶时间波动 [travel, travel_max] ----------
+
+def test_eroded_components_plain_green():
+    # 普通绿灯 [20,40)：波动 10 秒后收缩为 [20,30)
+    assert eroded_green_components(60, 20, 40, 10) == (False, [[20, 30]])
+    # 波动量恰好等于绿灯长度：整条被吃掉
+    assert eroded_green_components(60, 20, 40, 20) == (False, [])
+    assert eroded_green_components(60, 20, 40, 25) == (False, [])
+
+
+def test_eroded_components_wrapping_green_is_continuous_first():
+    # 跨零点连续时段 [50,70)：先视为整体再收缩，不会被拆成两段
+    assert eroded_green_components(60, 50, 10, 10) == (False, [[50, 60]])
+    assert eroded_green_components(60, 50, 10, 20) == (False, [])
+
+
+def test_eroded_components_always_green_unaffected():
+    # 常绿：无论波动多大都不受影响
+    assert eroded_green_components(60, 20, 20, 100) == (True, [])
+
+
+def test_fluctuation_shrinks_plain_window():
+    # 绿灯 [20,40)，行驶时间可能取 [0,10] 任意实数：
+    # 需 t 与 t+10 均在绿灯半开区间内 ⇔ t ∈ [20,30)
+    got = departure_windows_for_intersection(
+        60, 0, 20, 40, 0, 0, 180, travel_max=10
+    )
+    assert got == [[20, 30], [80, 90], [140, 150]]
+
+
+def test_fluctuation_continuous_wrapping_window():
+    # 跨零点绿灯 [50,60)∪[0,10)，行驶时间可能取 [0,10]：
+    # 连续时段 [50,70) 收缩为 [50,60)，shift=0 ⇔ 出发段 [50,60) 周期 60
+    got = departure_windows_for_intersection(
+        60, 0, 50, 10, 0, 0, 130, travel_max=10
+    )
+    assert got == [[50, 60], [110, 120]]
+
+
+def test_fluctuation_equals_green_length_yields_empty():
+    # 绿灯 20 秒、波动也是 20 秒：没有任何整数出发时刻能保证全程遇绿
+    got = departure_windows_for_intersection(
+        60, 0, 20, 40, 0, 0, 120, travel_max=20
+    )
+    assert got == []
+
+
+def test_always_green_unaffected_by_fluctuation():
+    got = departure_windows_for_intersection(
+        60, 0, 0, 0, 0, 10, 200, travel_max=300
+    )
+    assert got == [[10, 200]]
+
+
+def test_travel_max_defaults_to_travel():
+    # 省略 travel_max 时与固定行驶时间完全一致
+    with_max = departure_windows_for_intersection(
+        60, 10, 20, 40, 5, 0, 120, travel_max=5
+    )
+    without = departure_windows_for_intersection(
+        60, 10, 20, 40, 5, 0, 120
+    )
+    assert with_max == without == [[5, 25], [65, 85]]
+
+
+def test_compute_windows_with_fluctuation_multi_intersection():
+    # 路口 1：绿灯 [0,40) 无波动 ⇔ 出发段 [0,40) 周期 60
+    # 路口 2：绿灯 [0,50)、偏移 10、行驶 [10,20]（slack=10）
+    #   抵达相位区间 [t+20, t+30] 须整体落入某个 [60q, 60q+50)
+    #   ⇔ t ∈ [60q-20, 60q+20)，在 [0,120) 内为 [0,20) [40,80) [100,120)
+    # 两路口交集：[0,20) 与 [60,80)
+    nodes = [
+        it(cycle=60, green_start=0, green_end=40, travel=0),
+        it(cycle=60, offset=10, green_start=0, green_end=50,
+           travel=10, travel_max=20),
+    ]
+    assert compute_windows(nodes, 0, 120) == [[0, 20], [60, 80]]
+
+    # 路口 2 绿灯缩短为 [0,20)：收缩后仅 [0,10)，出发段 [60q-20,60q-10)
+    # 即 [40,50) [100,110)，与路口1 的 [0,40) [60,100) 无交集
+    nodes[1] = it(cycle=60, offset=10, green_start=0, green_end=20,
+                  travel=10, travel_max=20)
+    assert compute_windows(nodes, 0, 120) == []
+
+
 def test_brute_force_equivalence_on_random_cases():
     """与逐秒判定的参考实现完全一致（测试本身才允许逐秒）。"""
     import random
@@ -133,21 +219,33 @@ def test_brute_force_equivalence_on_random_cases():
     random.seed(42)
 
     def brute(nodes, lo, hi):
+        """逐秒参考实现：行驶时间取 [travel, travel_max] 内任意实数时，
+        整数出发时刻 t 可行 ⇔ 抵达闭区间 [t+T, t+Tmax] 整体落在展开时间轴的
+        某个绿灯半开分量内（常绿始终可行）。"""
         expected = []
         run_start = None
         for t in range(lo, hi + 1):
             ok = t < hi
             if ok:
                 for n in nodes:
-                    phase = (t + n["travel"] + n["offset"]) % n["cycle"]
+                    tmax = n.get("travel_max", n["travel"])
+                    arrive_lo = t + n["travel"] + n["offset"]
+                    arrive_hi = t + tmax + n["offset"]
                     gs, ge, c = n["green_start"], n["green_end"], n["cycle"]
                     if gs == ge:
-                        green = True
-                    elif gs < ge:
-                        green = gs <= phase < ge
+                        contained = True
                     else:
-                        green = phase >= gs or phase < ge
-                    if not green:
+                        contained = False
+                        q0 = arrive_lo // c - 2
+                        for q in range(q0, q0 + 6):
+                            if gs < ge:
+                                comp = (q * c + gs, q * c + ge)
+                            else:  # 跨零点：连续分量 [qC+gs, (q+1)C+ge)
+                                comp = (q * c + gs, (q + 1) * c + ge)
+                            if comp[0] <= arrive_lo and arrive_hi < comp[1]:
+                                contained = True
+                                break
+                    if not contained:
                         ok = False
                         break
             if ok:
@@ -161,22 +259,25 @@ def test_brute_force_equivalence_on_random_cases():
             expected.append([run_start, hi])
         return expected
 
-    for _ in range(300):
+    for _ in range(400):
         n_nodes = random.randint(1, 8)
         nodes = []
         for _ in range(n_nodes):
             c = random.randint(1, 90)
             gs = random.randint(0, c - 1)
             ge = random.randint(0, c - 1)
-            nodes.append(
-                it(
-                    cycle=c,
-                    offset=random.randint(0, c - 1),
-                    green_start=gs,
-                    green_end=ge,
-                    travel=random.randint(0, 120),
-                )
+            travel = random.randint(0, 120)
+            kwargs = dict(
+                cycle=c,
+                offset=random.randint(0, c - 1),
+                green_start=gs,
+                green_end=ge,
+                travel=travel,
             )
+            # 约一半用例带行驶时间波动；slack 偶尔超过绿灯长度甚至周期
+            if random.random() < 0.5:
+                kwargs["travel_max"] = travel + random.randint(0, 30)
+            nodes.append(it(**kwargs))
         length = random.randint(1, 600)
         lo = random.randint(0, 300)
         hi = lo + length

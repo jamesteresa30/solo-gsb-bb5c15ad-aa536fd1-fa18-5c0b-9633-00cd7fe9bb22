@@ -27,8 +27,21 @@ class Intersection(BaseModel):
         ..., ge=0, description="绿灯终点（本地相位秒，不含），需满足 0 <= g_end < C"
     )
     travel: int = Field(
-        ..., ge=0, le=MAX_CYCLE, description="从起点到该路口的固定行驶秒数"
+        ..., ge=0, le=MAX_CYCLE, description="从起点到该路口的行驶秒数下限 T"
     )
+    travel_max: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "行驶秒数上限 T_max（可选，缺省等于 travel）；实际行驶时间可取"
+            "闭区间 [travel, travel_max] 内任意实数秒"
+        ),
+    )
+
+    @property
+    def effective_travel_max(self) -> int:
+        """缺省时 travel_max 等于 travel。"""
+        return self.travel if self.travel_max is None else self.travel_max
 
     def validate_against_cycle(self) -> None:
         """校验所有以周期为上界的字段；不合法时抛出 HTTP 422。"""
@@ -43,6 +56,14 @@ class Intersection(BaseModel):
         if not 0 <= self.green_end < self.cycle:
             errors.append(
                 f"green_end 必须满足 0 <= green_end < cycle（路口 {label}）"
+            )
+        if self.effective_travel_max > MAX_CYCLE:
+            errors.append(
+                f"travel_max 不得大于 86400（路口 {label}）"
+            )
+        if self.effective_travel_max < self.travel:
+            errors.append(
+                f"travel_max 不得小于 travel（路口 {label}）"
             )
         if errors:
             raise HTTPException(status_code=422, detail=errors)

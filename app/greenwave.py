@@ -13,12 +13,20 @@
     - g_start < g_end：绿灯为 ``[g_start, g_end)``；
     - g_start > g_end：绿灯跨零点，为 ``[g_start, C) ∪ [0, g_end)``；
     - g_start == g_end：整周期常绿 ``[0, C)``；
-* ``travel`` : 从起点到该路口的固定行驶秒数 T。
+* ``travel`` : 从起点到该路口的行驶秒数下限 T（默认即固定行驶时间）；
+* ``travel_max`` : 可选的行驶秒数上限，缺省等于 ``travel``。实际行驶时间
+  可取闭区间 ``[T, T_max]`` 内的**任意实数**秒，出发窗口必须对其中每一种
+  取值都保证遇绿。
 
-出发时刻为 t 时，抵达时刻为 t + T，要求 ``(t + T + o) mod C`` 落在绿灯
-相位集合内。每个路口的可行出发时刻是一组周期重复的半开整数区间
-``[kC + a - shift, kC + b - shift)``（shift = (T + o) mod C），再与请求的
-发车范围 ``[depart_from, depart_to)`` 求交；各路口结果两两求交并合并相邻
+出发时刻为 t 时，抵达时刻覆盖闭区间 ``[t + T, t + T_max]``。令波动量
+``slack = T_max - T``，在展开（不绕零点）的时间轴上，绿灯半开区间 ``[a,b)``
+能容下整个抵达闭区间，当且仅当 ``a <= t+T+o`` 且 ``t+T_max+o < b``，即
+绿灯段被右端收缩为 ``[a, b - slack)``（slack >= 段长时该路口永不可行）。
+跨零点绿灯须先视为连续时段 ``[g_start, C + g_end)`` **再收缩**，不得拆成
+两段分别收缩；整周期常绿不受任何波动影响。每个路口收缩后的可行出发时刻是
+一组周期重复的半开整数区间 ``[kC + a - shift, kC + b - shift)``
+（shift = (T + o) mod C），再与请求的发车范围
+``[depart_from, depart_to)`` 求交；各路口结果两两求交并合并相邻
 （端点相接）区间，即得全部极大半开发车窗口。全程只做区间运算，不逐秒试探。
 """
 
@@ -73,6 +81,39 @@ def clip_intervals(
     return clipped
 
 
+def eroded_green_components(
+    cycle: int,
+    green_start: int,
+    green_end: int,
+    slack: int,
+) -> tuple[bool, list[Interval]]:
+    """波动量 slack 下、每个周期内的"连续"绿灯分量（出发轴视角）。
+
+    返回 ``(always_green, components)``：
+
+    * ``green_start == green_end``（整周期常绿）：返回 ``(True, [])``，
+      常绿不受行驶时间波动影响；
+    * 普通绿灯 ``[g_start, g_end)``：右端收缩为
+      ``[g_start, g_end - slack)``，slack >= 绿灯长度时为空；
+    * 跨零点绿灯：**先**视为连续时段 ``[g_start, C + g_end)`` **再收缩**
+      为 ``[g_start, C + g_end - slack)``（可能长于一个周期）。
+
+    收缩是针对"抵达闭区间整体落入绿灯半开区间"的最坏情形：
+    到达最早时刻可压在左端点（含），到达最晚时刻必须严格早于右端点。
+    """
+    if green_start == green_end:
+        return True, []
+    if green_start < green_end:
+        if slack >= green_end - green_start:
+            return False, []
+        return False, [[green_start, green_end - slack]]
+    # 跨零点：先视为连续的 [g_start, C + g_end)，再做右端收缩。
+    extended_end = cycle + green_end - slack
+    if extended_end <= green_start:
+        return False, []
+    return False, [[green_start, extended_end]]
+
+
 def departure_windows_for_intersection(
     cycle: int,
     offset: int,
@@ -81,15 +122,28 @@ def departure_windows_for_intersection(
     travel: int,
     depart_from: int,
     depart_to: int,
+    travel_max: int | None = None,
 ) -> list[Interval]:
-    """单个路口在 [depart_from, depart_to) 内的全部可行出发区间（已合并）。"""
-    greens = local_green_intervals(cycle, green_start, green_end)
-    # (t + T + o) mod C 与 (t + shift) mod C 等价。
+    """单个路口在 [depart_from, depart_to) 内的全部可行出发区间（已合并）。
+
+    ``travel_max`` 缺省等于 ``travel``（无波动）。行驶时间可能取闭区间
+    [travel, travel_max] 内任意实数秒时，只有对所有取值均遇绿的出发时刻
+    才会被保留。
+    """
+    if travel_max is None:
+        travel_max = travel
+    slack = travel_max - travel
+    always_green, components = eroded_green_components(
+        cycle, green_start, green_end, slack
+    )
+    if always_green:
+        return [[depart_from, depart_to]]
+    # (t + T + o) mod C 与 (t + shift) mod C 等价；slack 只影响绿灯长度。
     shift = (travel + offset) % cycle
 
     raw: list[Interval] = []
-    for local_start, local_end in greens:
-        # 本地绿灯 [a, b) 对应出发区间 [kC + a - shift, kC + b - shift)。
+    for local_start, local_end in components:
+        # 本地（已收缩）绿灯 [a, b) 对应出发区间 [kC + a - shift, kC + b - shift)。
         # 只需枚举与发车范围有非空交的周期 k：
         #   kC + b - shift > depart_from  ⇔  k > (depart_from - b + shift) / C
         #   kC + a - shift < depart_to    ⇔  k < (depart_to   - a + shift) / C
@@ -130,7 +184,9 @@ def compute_windows(
     """求所有路口均遇绿灯的全部极大半开发车区间，按起点排序。
 
     ``intersections`` 中的每个字典包含 cycle / offset / green_start /
-    green_end / travel 字段，由 Pydantic 模型保证合法。
+    green_end / travel 字段，以及可选的 travel_max 字段（缺省等于 travel，
+    表示行驶时间可能取 [travel, travel_max] 内任意实数秒），由 Pydantic 模型
+    保证合法。
     """
     common: list[Interval] | None = None
     for item in intersections:
@@ -140,6 +196,7 @@ def compute_windows(
             green_start=item["green_start"],
             green_end=item["green_end"],
             travel=item["travel"],
+            travel_max=item.get("travel_max"),
             depart_from=depart_from,
             depart_to=depart_to,
         )
