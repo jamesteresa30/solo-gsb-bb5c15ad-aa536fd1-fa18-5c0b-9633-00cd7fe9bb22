@@ -3,6 +3,7 @@ import pytest
 from app.greenwave import (
     compute_windows,
     departure_windows_for_intersection,
+    eroded_green_intervals,
     intersect_interval_lists,
     local_green_intervals,
     merge_intervals,
@@ -93,6 +94,83 @@ def test_green_equal_to_range_boundary_yields_empty():
     assert got == []  # [20,40) 与范围无交；下一段 [80,100) 也无交
 
 
+# ---------- 行驶时间波动（travel_max） ----------
+
+def test_eroded_green_normal():
+    # 普通绿灯 [10, 30) 收缩入口端 5 秒
+    assert eroded_green_intervals(60, 10, 30, 5) == [[10, 25]]
+    assert eroded_green_intervals(60, 10, 30, 0) == [[10, 30]]
+    # 收缩量等于绿灯长度：任何非零抵达弧都放不进半开绿灯
+    assert eroded_green_intervals(60, 10, 30, 20) == []
+    assert eroded_green_intervals(60, 10, 30, 21) == []
+
+
+def test_eroded_green_full_cycle_unaffected():
+    # 整周期常绿不受任何波动量影响
+    assert eroded_green_intervals(60, 0, 0, 59) == [[0, 60]]
+    assert eroded_green_intervals(60, 20, 20, 86400) == [[0, 60]]
+
+
+def test_eroded_green_wrapping_treated_as_continuous_arc():
+    # 跨零点 [50,60)∪[0,10) 视为连续弧 [50,70) 再收缩：
+    # slack=5 后 [50,65) 映射回 [50,60)∪[0,5)，仍是跨零点两段
+    assert eroded_green_intervals(60, 50, 10, 5) == [[50, 60], [0, 5]]
+    # slack=15 后 [50,55) 收缩成不跨零点的一段
+    assert eroded_green_intervals(60, 50, 10, 15) == [[50, 55]]
+    # slack=20 恰好退化为空（半开端点 50 不含）
+    assert eroded_green_intervals(60, 50, 10, 20) == []
+    assert eroded_green_intervals(60, 50, 10, 21) == []
+
+
+def test_slack_shrinks_departure_window():
+    # 绿灯 [20,40) 长 20 秒，行驶 T=15、波动 5：只剩收缩绿灯 [20,35)
+    # 对应出发区间 [5,20)
+    got = departure_windows_for_intersection(60, 0, 20, 40, 15, 0, 60, slack=5)
+    assert got == [[5, 20]]
+
+
+def test_slack_equal_green_length_yields_empty():
+    # 波动量等于绿灯长度：无法保证抵达弧整体遇绿
+    got = departure_windows_for_intersection(60, 0, 20, 40, 0, 0, 120, slack=20)
+    assert got == []
+
+
+def test_full_cycle_green_immune_to_slack():
+    # 常绿（green_start == green_end）：即使波动 120 秒（超过周期），整个发车范围仍可行
+    got = departure_windows_for_intersection(60, 0, 0, 0, 0, 0, 600, slack=120)
+    assert got == [[0, 600]]
+
+
+def test_wrapping_green_continuous_shrink_departure():
+    # 跨零点绿灯 [50,10)，行驶 5 秒、波动 5 秒：
+    # 连续弧收缩后为 [50,60)∪[0,5)，按 shift=5 平移到出发轴并裁剪 [0,125)
+    got = departure_windows_for_intersection(60, 0, 50, 10, 5, 0, 125, slack=5)
+    # [45,55) 与 [55,60) 端点相接，合并为 [45,60)
+    assert got == [[45, 60], [105, 120]]
+
+
+def test_compute_windows_with_travel_max():
+    # 路口 1：绿灯 [0,30)、行驶 0..5，收缩为 [0,25)
+    # 路口 2：常绿、行驶 30..40，不受波动影响，offset=30 补偿 30 秒基准行程
+    nodes = [
+        it(cycle=60, offset=0, green_start=0, green_end=30, travel=0, travel_max=5),
+        it(cycle=60, offset=30, green_start=0, green_end=0, travel=30, travel_max=40),
+    ]
+    assert compute_windows(nodes, 0, 300) == [
+        [0, 25], [60, 85], [120, 145], [180, 205], [240, 265],
+    ]
+
+
+def test_travel_max_defaults_to_travel():
+    # 省略 travel_max 与显式 travel_max == travel 等价
+    nodes = [it(cycle=60, green_start=0, green_end=30, travel=0)]
+    nodes_max = [
+        it(cycle=60, green_start=0, green_end=30, travel=0, travel_max=0)
+    ]
+    assert compute_windows(nodes, 0, 120) == compute_windows(nodes_max, 0, 120)
+    assert compute_windows(nodes, 0, 120) == [[0, 30], [60, 90]]
+
+
 # ---------- 多路口联动（端到端，含暴力对照） ----------
 
 # 下游路口相位偏移 30 秒，恰好补偿 30 秒行程，两路口可行域完全重合
@@ -177,6 +255,81 @@ def test_brute_force_equivalence_on_random_cases():
                     travel=random.randint(0, 120),
                 )
             )
+        length = random.randint(1, 600)
+        lo = random.randint(0, 300)
+        hi = lo + length
+        assert compute_windows(nodes, lo, hi) == brute(nodes, lo, hi)
+
+
+def test_brute_force_equivalence_with_travel_max():
+    """带行驶时间波动时，与逐秒的“抵达弧整体落入绿灯”参考实现一致。"""
+    import random
+
+    random.seed(7)
+
+    def green_arcs(c, gs, ge):
+        # 提升到实数轴的周期弧：跨零点先视为 [gs, C+ge) 的连续弧
+        if gs == ge:
+            return [(0, c)]
+        if gs < ge:
+            return [(gs, ge)]
+        return [(gs, c + ge)]
+
+    def brute(nodes, lo, hi):
+        expected = []
+        run_start = None
+        for t in range(lo, hi + 1):
+            ok = t < hi
+            if ok:
+                for n in nodes:
+                    # 整周期常绿：任意抵达时刻（含跨周期）均为绿灯
+                    if n["green_start"] == n["green_end"]:
+                        continue
+                    c, o = n["cycle"], n["offset"]
+                    t0 = t + n["travel"] + o
+                    t1 = t + n.get("travel_max", n["travel"]) + o
+                    contained = False
+                    for a0, b0 in green_arcs(c, n["green_start"], n["green_end"]):
+                        for k in range(t0 // c - 2, t1 // c + 3):
+                            a, b = a0 + k * c, b0 + k * c
+                            # 抵达弧 [t0,t1] 须整体落入半开绿灯 [a,b)
+                            if a <= t0 and t1 < b:
+                                contained = True
+                                break
+                        if contained:
+                            break
+                    if not contained:
+                        ok = False
+                        break
+            if ok:
+                if run_start is None:
+                    run_start = t
+            else:
+                if run_start is not None:
+                    expected.append([run_start, t])
+                    run_start = None
+        if run_start is not None:
+            expected.append([run_start, hi])
+        return expected
+
+    for _ in range(300):
+        n_nodes = random.randint(1, 8)
+        nodes = []
+        for _ in range(n_nodes):
+            c = random.randint(1, 90)
+            gs = random.randint(0, c - 1)
+            ge = random.randint(0, c - 1)
+            travel = random.randint(0, 120)
+            node = it(
+                cycle=c,
+                offset=random.randint(0, c - 1),
+                green_start=gs,
+                green_end=ge,
+                travel=travel,
+            )
+            if random.random() < 0.7:
+                node["travel_max"] = travel + random.randint(0, 2 * c)
+            nodes.append(node)
         length = random.randint(1, 600)
         lo = random.randint(0, 300)
         hi = lo + length

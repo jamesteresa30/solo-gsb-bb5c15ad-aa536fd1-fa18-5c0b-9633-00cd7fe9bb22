@@ -41,6 +41,70 @@ def test_api_empty_array_on_no_solution():
     assert green_wave_windows(req) == []
 
 
+def test_api_travel_max_shrinks_windows():
+    req = make_request(
+        {
+            "depart_from": 0,
+            "depart_to": 300,
+            "intersections": [
+                {
+                    "cycle": 60, "offset": 0, "green_start": 0, "green_end": 30,
+                    "travel": 0, "travel_max": 5,
+                },
+                {
+                    "cycle": 60, "offset": 30, "green_start": 0, "green_end": 0,
+                    "travel": 30, "travel_max": 40,
+                },
+            ],
+        }
+    )
+    windows = green_wave_windows(req)
+    assert [[w.start, w.end] for w in windows] == [
+        [0, 25], [60, 85], [120, 145], [180, 205], [240, 265],
+    ]
+
+
+def test_api_travel_max_default_equals_travel():
+    payload = {
+        "depart_from": 0,
+        "depart_to": 60,
+        "intersections": [
+            {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 40, "travel": 15}
+        ],
+    }
+    without = green_wave_windows(make_request(payload))
+    payload["intersections"][0]["travel_max"] = 15
+    with_default = green_wave_windows(make_request(payload))
+    assert [[w.start, w.end] for w in without] == [[5, 25]]
+    assert without == with_default
+
+
+def test_reject_travel_max_below_travel():
+    req = make_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "intersections": [
+                {
+                    "cycle": 60, "offset": 0, "green_start": 0, "green_end": 30,
+                    "travel": 20, "travel_max": 19,
+                }
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        req.validate_ranges()
+    assert exc.value.status_code == 422
+
+
+def test_reject_travel_max_above_limit():
+    with pytest.raises(ValidationError):
+        Intersection(
+            cycle=60, offset=0, green_start=0, green_end=10, travel=0,
+            travel_max=86401,
+        )
+
+
 def test_reject_invalid_cycle():
     with pytest.raises(ValidationError):
         Intersection(cycle=0, offset=0, green_start=0, green_end=10, travel=0)

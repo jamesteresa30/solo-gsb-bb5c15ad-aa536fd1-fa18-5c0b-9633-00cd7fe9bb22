@@ -11,8 +11,9 @@ app = FastAPI(
     title="干线绿波发车窗口 API",
     description=(
         "给定干线上至多 8 个路口的信号周期、相位偏移、周期内绿灯半开区间"
-        "（可跨周期零点）及固定行驶秒数，计算在指定发车范围（<= 3600 秒）内"
-        "抵达每个路口均遇绿灯的全部极大半开发车区间。"
+        "（可跨周期零点）及行驶秒数（可选波动上限 travel_max），计算在指定"
+        "发车范围（<= 3600 秒）内，对行驶时间区间内任意取值都能在抵达每个"
+        "路口时遇绿灯的全部极大半开发车区间。"
     ),
     version="1.0.0",
 )
@@ -39,6 +40,7 @@ def green_wave_windows(request: GreenWaveRequest) -> list[Window]:
                 "green_start": item.green_start,
                 "green_end": item.green_end,
                 "travel": item.travel,
+                "travel_max": item.travel_max,
             }
             for item in request.intersections
         ],
